@@ -1,0 +1,50 @@
+config firewall address
+    edit "IOC-SC-Relay-185.99.255.28"
+        set subnet 185.99.255.28 255.255.255.255
+    next
+    edit "IOC-SC-C2-155.94.150.39"
+        set subnet 155.94.150.39 255.255.255.255
+    next
+    edit "IOC-FQDN-newnewnew.gotdns.org"
+        set type fqdn
+        set fqdn "newnewnew.gotdns.org"
+    next
+    edit "IOC-FQDN-soxnewwork.homedns.org"
+        set type fqdn
+        set fqdn "soxnewwork.homedns.org"
+    next
+    edit "IOC-FQDN-sc.payproofkit.com"
+        set type fqdn
+        set fqdn "sc.payproofkit.com"
+    next
+    edit "IOC-FQDN-ns.mo7sen.dev"
+        set type fqdn
+        set fqdn "ns.mo7sen.dev"
+    next
+    edit "IOC-FQDN-cdn007-digitaldownloads.com"
+        set type fqdn
+        set fqdn "cdn007-digitaldownloads.com"
+    next
+end
+ 
+config firewall addrgrp
+    edit "GRP-IOC-ScreenConnect-Addmin"
+        set member "IOC-SC-Relay-185.99.255.28" "IOC-SC-C2-155.94.150.39" "IOC-FQDN-newnewnew.gotdns.org" "IOC-FQDN-soxnewwork.homedns.org" "IOC-FQDN-sc.payproofkit.com" "IOC-FQDN-ns.mo7sen.dev" "IOC-FQDN-cdn007-digitaldownloads.com"
+        set comment "ScreenConnect campaign IOCs (actor Addmin) 2026-11-12"
+    next
+end
+ 
+config firewall policy
+    edit 0
+        set name "BLOCK-IOC-ScreenConnect-Addmin"
+        set srcintf "########CHANGEME########"
+        set dstintf "########CHANGEME########"
+        set srcaddr "all"
+        set dstaddr "GRP-IOC-ScreenConnect-Addmin"
+        set action deny
+        set schedule "always"
+        set service "ALL"
+        set logtraffic all
+        set comments "Block ScreenConnect campaign IOCs"
+    next
+end
