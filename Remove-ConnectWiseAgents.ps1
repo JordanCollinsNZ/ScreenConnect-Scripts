@@ -15,7 +15,13 @@
          rules, Run entries, SafeBoot entries, event log sources and credential providers
       4. Anything still locked is scheduled for deletion at the next reboot
 
-    The ConnectWise Automate Control Center (LTClient.exe / "LabTech Client" folder) is NOT touched.
+    The Automate part mirrors ConnectWise's own Agent_Uninstall.exe / LabUninstall.exe (v31.1):
+    wodVpn.dll unregistration, LabVNC/TightVNC, LTCache/LTUpdate/LTApp temp folders, per-user LabTech
+    keys, Installer component/cached-package/Package Cache cleanup, Automate's named firewall rules,
+    Windows Update policy + Update Orchestrator (UsoSvc) revert, Sysinternals/UltraVNC/Tracing keys.
+
+    The ConnectWise Automate Control Center (LTClient.exe / "LabTech Client" folder) is NOT touched,
+    and Automate agent removal is refused on an Automate SERVER.
 
     Exit codes: 0 = clean, 3010 = clean but reboot needed to finish, 1 = error / items left over.
 
@@ -24,6 +30,11 @@
 
 .PARAMETER SkipScreenConnect
     Don't touch ScreenConnect.
+
+.PARAMETER SkipWindowsUpdateReset
+    Don't revert the Windows Update policy values / UsoSvc changes that Automate patch management
+    makes (ConnectWise's own uninstaller reverts them). Use this if another tool or GPO now owns
+    Windows Update settings on the machine.
 
 .PARAMETER ScreenConnectThumbprint
     Only remove ScreenConnect instances named "... Client (<thumbprint>)". Comma-separate several.
@@ -57,6 +68,7 @@
 param(
     [switch]$SkipAutomate,
     [switch]$SkipScreenConnect,
+    [switch]$SkipWindowsUpdateReset,
     [string[]]$ScreenConnectThumbprint,
     [switch]$DryRun,
     [switch]$Detach,
@@ -288,10 +300,10 @@ function Remove-RegValuesMatching {
     foreach ($vn in $k.GetValueNames()) {
         $data = [string]$k.GetValue($vn)
         if (& $Predicate $vn $data) {
-            if ($DryRun) { Write-Log "Would delete registry value: $KeyPath\$vn" DRY; continue }
+            if ($DryRun) { Write-Log "Would delete registry value: $KeyPath\$vn = $data" DRY; continue }
             try {
                 Remove-ItemProperty -LiteralPath $KeyPath -Name $vn -Force -ErrorAction Stop
-                Write-Log "Deleted registry value: $KeyPath\$vn" OK
+                Write-Log "Deleted registry value: $KeyPath\$vn (was: $data)" OK
             } catch { Write-Log "Failed to delete value $KeyPath\${vn}: $($_.Exception.Message)" ERROR }
         }
     }
@@ -385,10 +397,18 @@ function Get-UninstallEntries {
                 Key             = $k.PSPath
                 KeyName         = $k.PSChildName
                 DisplayName     = [string]$k.GetValue('DisplayName')
+                OldDisplayName  = [string]$k.GetValue('OldDisplayName')
                 UninstallString = [string]$k.GetValue('UninstallString')
             }
         }
     }
+}
+
+function Test-EntryMatch($Entry, [scriptblock]$Predicate) {
+    foreach ($n in $Entry.DisplayName, $Entry.OldDisplayName) {
+        if ($n -and (& $Predicate $n)) { return $true }
+    }
+    return $false
 }
 
 function Get-InstallerProducts {
@@ -405,11 +425,11 @@ function Get-ProductCodes {
     param([scriptblock]$Predicate, [string[]]$KnownCodes = @())
     $found = @{}
     foreach ($e in Get-UninstallEntries) {
-        if ($e.DisplayName -and (& $Predicate $e.DisplayName)) {
+        if (Test-EntryMatch $e $Predicate) {
             $code = $null
             if ($e.KeyName -match '^\{[0-9A-Fa-f-]{36}\}$') { $code = $e.KeyName.ToUpper() }
             elseif ($e.UninstallString -match '(?i)msiexec.*?(\{[0-9A-F-]{36}\})') { $code = $Matches[1].ToUpper() }
-            if ($code) { $found[$code] = $e.DisplayName }
+            if ($code) { $found[$code] = $(if ($e.DisplayName) { $e.DisplayName } else { $e.OldDisplayName }) }
         }
     }
     foreach ($p in Get-InstallerProducts) {
@@ -449,26 +469,88 @@ function Invoke-MsiUninstall([string]$ProductCode, [string]$Label) {
     }
 }
 
+function Remove-MsiComponentRefs([string]$Packed) {
+    # Removes this product's references from UserData\<sid>\Components (what LabUninstall.exe does).
+    # Slow-ish (tens of thousands of keys), so only called when msiexec failed to unregister the product.
+    Write-Log "Scanning Windows Installer component registrations for $Packed (can take a minute)..."
+    $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    $ud = $hklm.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData')
+    if (-not $ud) { $hklm.Close(); return }
+    $count = 0
+    foreach ($sid in $ud.GetSubKeyNames()) {
+        $comps = $ud.OpenSubKey("$sid\Components")
+        if (-not $comps) { continue }
+        foreach ($c in $comps.GetSubKeyNames()) {
+            $ck = $comps.OpenSubKey($c)
+            if (-not $ck) { continue }
+            $has  = $ck.GetValueNames() -contains $Packed
+            $only = $has -and ($ck.ValueCount -eq 1) -and ($ck.SubKeyCount -eq 0)
+            $ck.Close()
+            if (-not $has) { continue }
+            $count++
+            if ($DryRun) { continue }
+            try {
+                if ($only) {
+                    $w = $ud.OpenSubKey("$sid\Components", $true); $w.DeleteSubKey($c); $w.Close()
+                } else {
+                    $w = $ud.OpenSubKey("$sid\Components\$c", $true); $w.DeleteValue($Packed); $w.Close()
+                }
+            } catch { Write-Log "Could not clean component ${c}: $($_.Exception.Message)" WARN }
+        }
+        $comps.Close()
+    }
+    $ud.Close(); $hklm.Close()
+    if ($count -gt 0) {
+        if ($DryRun) { Write-Log "Would remove $count component reference(s)" DRY }
+        else { Write-Log "Removed $count component reference(s)" OK }
+    }
+}
+
 function Remove-MsiLeftovers([string]$ProductCode) {
     $packed = ConvertTo-PackedGuid $ProductCode
     if (-not $packed) { return }
-    Remove-RegKeySafe "HKLM:\SOFTWARE\Classes\Installer\Products\$packed"
-    Remove-RegKeySafe "HKLM:\SOFTWARE\Classes\Installer\Features\$packed"
-    Remove-RegKeySafe "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$packed"
-    Remove-RegKeySafe "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$ProductCode"
-    Remove-RegKeySafe "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$ProductCode"
-    foreach ($uc in @(Get-ChildItem 'HKLM:\SOFTWARE\Classes\Installer\UpgradeCodes' -ErrorAction SilentlyContinue)) {
-        if ($uc.GetValueNames() -contains $packed) {
-            if ($uc.ValueCount -le 1) { Remove-RegKeySafe $uc.PSPath }
-            elseif ($DryRun) { Write-Log "Would remove $packed from $($uc.PSChildName)" DRY }
-            else { Remove-ItemProperty -LiteralPath $uc.PSPath -Name $packed -Force -ErrorAction SilentlyContinue }
+    $ProductCode = ConvertFrom-PackedGuid $packed   # normalise to {UPPERCASE}
+
+    $udRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData'
+    $udProducts = @(
+        Get-ChildItem -LiteralPath $udRoot -ErrorAction SilentlyContinue |
+            ForEach-Object { "$($_.PSPath)\Products\$packed" } |
+            Where-Object { Test-Path -LiteralPath $_ }
+    )
+    $stillRegistered = (Test-Path -LiteralPath "HKLM:\SOFTWARE\Classes\Installer\Products\$packed") -or ($udProducts.Count -gt 0)
+
+    if ($stillRegistered) {
+        Write-Log "Windows Installer still has $ProductCode registered - removing registration manually"
+        # Cached MSI in C:\Windows\Installer
+        foreach ($p in $udProducts) {
+            $lp = [string](Get-ItemProperty -LiteralPath "$p\InstallProperties" -ErrorAction SilentlyContinue).LocalPackage
+            if ($lp -and $lp -like "$env:windir\Installer\*.msi") { Remove-PathSafe $lp }
+        }
+        Remove-MsiComponentRefs $packed
+        Remove-RegKeySafe "HKLM:\SOFTWARE\Classes\Installer\Products\$packed"
+        Remove-RegKeySafe "HKLM:\SOFTWARE\Classes\Installer\Features\$packed"
+        foreach ($p in $udProducts) { Remove-RegKeySafe $p }
+        foreach ($ucRoot in 'HKLM:\SOFTWARE\Classes\Installer\UpgradeCodes',
+                            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UpgradeCodes') {
+            foreach ($uc in @(Get-ChildItem -LiteralPath $ucRoot -ErrorAction SilentlyContinue)) {
+                if ($uc.GetValueNames() -contains $packed) {
+                    if ($uc.ValueCount -le 1) { Remove-RegKeySafe $uc.PSPath }
+                    elseif ($DryRun) { Write-Log "Would remove $packed from upgrade code $($uc.PSChildName)" DRY }
+                    else { Remove-ItemProperty -LiteralPath $uc.PSPath -Name $packed -Force -ErrorAction SilentlyContinue }
+                }
+            }
         }
     }
+
+    Remove-RegKeySafe "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$ProductCode"
+    Remove-RegKeySafe "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$ProductCode"
+    Remove-RegKeySafe "HKLM:\SOFTWARE\Classes\Installer\Dependencies\$ProductCode"
+    Remove-PathPatterns -Patterns @("$env:ProgramData\Package Cache\$ProductCode*")
 }
 
 function Remove-ArpEntries([scriptblock]$Predicate) {
     foreach ($e in Get-UninstallEntries) {
-        if ($e.DisplayName -and (& $Predicate $e.DisplayName)) { Remove-RegKeySafe $e.Key }
+        if (Test-EntryMatch $e $Predicate) { Remove-RegKeySafe $e.Key }
     }
 }
 
@@ -525,25 +607,37 @@ function Get-RunKeys {
 #region ---------- Product definitions ----------
 
 # --- ConnectWise Automate agent ---
-$LtServiceNames    = @('LTService', 'LTSvcMon', 'LabVNC')
-$LtSvcPredicate    = { param($name, $image) ($LtServiceNames -contains $name) -or ($image -match '\\LTSvc\\') }
+$script:LtBasePaths = @("$env:windir\LTSvc")   # extended at runtime from HKLM\SOFTWARE\LabTech\Service\BasePath
+$script:LtExtraCodes = @()                    # from Update.ini [CUSTOM] AddremoveGuid (branded agents)
+$script:LtTrayPort  = $null
+$LtServiceNames    = @('LTService', 'LTSvcMon', 'LTServiceMon', 'LabVNC')
+$LtPathPredicate   = {
+    param($p)
+    if (-not $p) { return $false }
+    if ($p -match '\\LTSvc\\') { return $true }
+    foreach ($b in $script:LtBasePaths) { if ($p.IndexOf("$b\", [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } }
+    return $false
+}
+$LtSvcPredicate    = { param($name, $image) ($LtServiceNames -contains $name) -or (& $LtPathPredicate $image) }
 $LtProductPredicate = { param($n) ($n -match 'LabTech|ConnectWise Automate') -and ($n -match 'Agent|Remote') -and ($n -notmatch 'Control Center') }
-$LtPathPredicate   = { param($p) $p -match '\\LTSvc\\' }
-$LtTextPredicate   = { param($t) $t -match '\\LTSvc\\|LTTray|LabTech Agent|LabTech\\Service' }
-$LtProcessRegex    = '^(LTSVC|LTSvcMon|LTTray|LabVNC)$'
-$LtKnownCodes      = @('{58A3001D-B675-4D67-A5A1-0FA9F08CF7CA}')   # LabTech/Automate agent MSI
-$LtFolders = @(
-    "$env:windir\LTSvc",
-    "$env:windir\Temp\LabTech",
-    "$env:windir\Temp\_LTUpdate",
-    "$env:windir\SystemTemp\LabTech",
-    "$env:windir\SystemTemp\_LTUpdate"
+$LtTextPredicate   = { param($t) ($t -match '\\LTSvc\\|LTTray|LabTech Agent|LabTech\\Service') -or (& $LtPathPredicate $t) }
+$LtProcessRegex    = '^(LTSVC|LTSvcMon|LTServiceMon|LTTray|LabVNC)$'
+$LtKnownCodes      = @(
+    '{58A3001D-B675-4D67-A5A1-0FA9F08CF7CA}',   # agent MSI
+    '{3F460D4C-D217-46B4-80B6-B5ED50BD7CF5}',   # agent MSI
+    '{206A1CA5-EB86-400E-8B60-B27869F18501}',   # the rest: Installer\Dependencies / Package Cache
+    '{04DEC523-746F-4527-B75F-141E3CB0D0AA}',   #   entries cleaned by ConnectWise's LabUninstall.exe
+    '{A7E919B0-AB60-4BA7-A4E5-E1C87E23A5BF}'
 )
-$LtRegKeys = @(
-    'HKLM:\SOFTWARE\LabTech',
-    'HKLM:\SOFTWARE\WOW6432Node\LabTech',
-    'HKLM:\SOFTWARE\LabTechMSP',
-    'HKLM:\SOFTWARE\WOW6432Node\LabTechMSP'
+$LtTempItems  = @('LabTech', '_LTUpdate', 'LTUpdate', 'LTCache', 'LTApp', 'LTErrors.txt')
+$LtRegSubKeys = @('Service', 'Tray', 'Probe', 'ProbeService', 'Plugins')
+$LtTracingKeys = @(
+    'LabtechRemoteAgentAutoInstall_RASAPI32', 'LabtechRemoteAgentAutoInstall_RASMANCS',
+    'LTSVC_RASAPI32', 'LTSVC_RASMANCS', 'LTSvcMon_RASAPI32', 'LTvcMon_RASAPI32', 'LTSvcMon_RASMANCS'
+)
+$LtFirewallRuleNames = @(
+    'Allow NetFasTalk', 'Allow Local VNC', 'Allow Local Redir', 'Allow Tunnel StunRelay',
+    'Allow Tunnel', 'AgentService', 'AgentMonitor', 'AgentTray'
 )
 
 # --- ScreenConnect / ConnectWise Control client ---
@@ -568,37 +662,181 @@ $ScSharedFolders = @(   # only removed when no thumbprint filter is used
 
 #region ---------- Removal routines ----------
 
+function Initialize-AutomatePaths {
+    # Read where the agent actually lives / which branded product code it uses BEFORE the registry is wiped
+    $protected = @($env:windir, "$env:windir\System32", $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, "$env:SystemDrive\") |
+        Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') }
+    foreach ($k in 'HKLM:\SOFTWARE\LabTech\Service', 'HKLM:\SOFTWARE\WOW6432Node\LabTech\Service') {
+        $props = Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue
+        if (-not $props) { continue }
+        if ($props.BasePath) {
+            $bp = [Environment]::ExpandEnvironmentVariables([string]$props.BasePath).TrimEnd('\')
+            if ($bp -match '^[A-Za-z]:\\[^\\]+' -and $protected -notcontains $bp -and $script:LtBasePaths -notcontains $bp) {
+                $script:LtBasePaths += $bp
+                Write-Log "Agent base path from registry: $bp"
+            }
+        }
+        $tp = 0
+        if ($props.TrayPort -and [int]::TryParse([string]$props.TrayPort, [ref]$tp) -and $tp -gt 0 -and $tp -lt 65536) { $script:LtTrayPort = $tp }
+    }
+    foreach ($b in $script:LtBasePaths) {
+        $ini = Join-Path $b 'Update.ini'
+        if (-not (Test-Path -LiteralPath $ini)) { continue }
+        foreach ($line in @(Get-Content -LiteralPath $ini -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*AddremoveGuid\s*=\s*\{?([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\}?') {
+                $g = '{' + $Matches[1].ToUpper() + '}'
+                if ($script:LtExtraCodes -notcontains $g) { $script:LtExtraCodes += $g; Write-Log "Custom product code from Update.ini: $g" }
+            }
+        }
+    }
+}
+
+function Remove-AutomateFirewallRules {
+    # Named rules + legacy port openings that LabUninstall.exe removes
+    if ($DryRun) {
+        Write-Log ("Would delete firewall rules named: {0}" -f ($LtFirewallRuleNames -join ', ')) DRY
+    } else {
+        foreach ($n in $LtFirewallRuleNames) {
+            $p = Start-Process -FilePath "$env:windir\System32\netsh.exe" -ArgumentList "advfirewall firewall delete rule name=`"$n`"" -Wait -PassThru -WindowStyle Hidden
+            if ($p.ExitCode -eq 0) { Write-Log "Deleted firewall rule: $n" OK }
+        }
+        $legacy = @('tcp 4996', 'tcp 4997', 'tcp 4998', 'tcp 4999', 'udp 162')
+        if ($script:LtTrayPort) { $legacy += "udp $($script:LtTrayPort)" }
+        foreach ($l in $legacy) {
+            Start-Process -FilePath "$env:windir\System32\netsh.exe" -ArgumentList "firewall delete portopening $l" -Wait -WindowStyle Hidden
+        }
+    }
+    # Any other rule pointing at the agent's executables
+    Remove-MatchingFirewallRules { param($d) & $LtPathPredicate $d }
+}
+
+function Reset-AutomatePatchingSettings {
+    if ($SkipWindowsUpdateReset) { Write-Log 'Skipping Windows Update reset (-SkipWindowsUpdateReset)'; return }
+    Write-Log 'Reverting Windows Update settings changed by Automate patch management'
+    $wuValueNames = @(
+        'ElevateNonAdmins', 'TargetGroup', 'TargetGroupEnabled', 'WUServer', 'WUStatusServer',
+        'DisableWindowsUpdateAccess', 'NoAutoUpdate', 'UseWUServer', 'NoAutoRebootWithLoggedOnUsers', 'AUOptions'
+    )
+    foreach ($k in 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate',
+                   'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU',
+                   'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update') {
+        Remove-RegValuesMatching $k { param($n, $d) $wuValueNames -contains $n }
+    }
+
+    $scKey = 'HKLM:\SOFTWARE\Microsoft\Security Center'
+    $udn = (Get-ItemProperty -LiteralPath $scKey -Name UpdatesDisableNotify -ErrorAction SilentlyContinue).UpdatesDisableNotify
+    if ($udn) {
+        if ($DryRun) { Write-Log 'Would set Security Center UpdatesDisableNotify = 0' DRY }
+        else { Set-ItemProperty -LiteralPath $scKey -Name UpdatesDisableNotify -Value 0 -Type DWord -ErrorAction SilentlyContinue; Write-Log 'Set Security Center UpdatesDisableNotify = 0' OK }
+    }
+    Remove-RegValuesMatching 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' { param($n, $d) $n -eq 'HideSCAHealth' }
+
+    # Automate disables the Update Orchestrator service while it manages patching
+    $uso = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\UsoSvc' -Name Start -ErrorAction SilentlyContinue
+    if ($uso -and $uso.Start -eq 4) {
+        if ($DryRun) { Write-Log 'Would re-enable Update Orchestrator service (UsoSvc)' DRY }
+        else {
+            & sc.exe config UsoSvc start= delayed-auto 2>&1 | Out-Null
+            & sc.exe failure UsoSvc reset= 86400 actions= restart/120000/restart/120000 2>&1 | Out-Null
+            Write-Log 'Re-enabled Update Orchestrator service (UsoSvc) and reset its recovery actions' OK
+        }
+    }
+}
+
 function Invoke-AutomateRemoval {
     Write-Section 'ConnectWise Automate (LabTech) agent'
+
+    # Same safety checks as LabUninstall.exe: never strip an Automate server, and keep
+    # Control Center settings if the Control Center is installed on this machine.
+    $isServer = (Test-Path "$env:ProgramFiles\LabTech\LTAgent.exe") -or
+                (${env:ProgramFiles(x86)} -and (Test-Path "${env:ProgramFiles(x86)}\LabTech\LTAgent.exe")) -or
+                (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LabMySQL') -or
+                (Test-Path "$env:SystemDrive\inetpub\wwwroot\LabTech\bin\LabTech.dll") -or
+                (Test-Path "$env:SystemDrive\inetpub\wwwroot\WCC2\bin\LabTech Web.dll")
+    if ($isServer) {
+        Write-Log 'This machine looks like an Automate SERVER - skipping Automate agent removal.' ERROR
+        return
+    }
+    $hasControlCenter = (Test-Path "$env:ProgramFiles\LabTech Client\LTClient.exe") -or
+                        (${env:ProgramFiles(x86)} -and (Test-Path "${env:ProgramFiles(x86)}\LabTech Client\LTClient.exe"))
+    if ($hasControlCenter) { Write-Log 'Automate Control Center detected - its folder and settings will be kept' }
+
+    Initialize-AutomatePaths
 
     $services = Get-ServiceNamesMatching $LtSvcPredicate
     Write-Log ("Services found: {0}" -f ($(if ($services) { $services -join ', ' } else { 'none' })))
     foreach ($s in $services) { Stop-ServiceHard $s }
     Stop-MatchingProcesses -NameRegex $LtProcessRegex -PathPredicate $LtPathPredicate
 
-    $codes = Get-ProductCodes -Predicate $LtProductPredicate -KnownCodes $LtKnownCodes
+    $codes = Get-ProductCodes -Predicate $LtProductPredicate -KnownCodes ($LtKnownCodes + $script:LtExtraCodes)
     if ($codes.Count -eq 0) { Write-Log 'No Automate agent MSI registration found' }
     foreach ($code in @($codes.Keys)) { Invoke-MsiUninstall $code $codes[$code] }
 
     # msiexec custom actions may have restarted something
     Stop-MatchingProcesses -NameRegex $LtProcessRegex -PathPredicate $LtPathPredicate
 
+    # Unregister the agent's VPN COM component before its folder goes
+    foreach ($b in $script:LtBasePaths) {
+        $dll = Join-Path $b 'wodVpn.dll'
+        if (-not (Test-Path -LiteralPath $dll)) { continue }
+        if ($DryRun) { Write-Log "Would unregister $dll" DRY; continue }
+        Start-Process -FilePath "$env:windir\System32\regsvr32.exe" -ArgumentList "/u /s `"$dll`"" -Wait -WindowStyle Hidden
+        Write-Log "Unregistered $dll" OK
+    }
+
     foreach ($s in (Get-ServiceNamesMatching $LtSvcPredicate)) { Remove-ServiceHard $s }
-    foreach ($code in @($codes.Keys)) { Remove-MsiLeftovers $code }
+    $allCodes = @(@($codes.Keys) + $LtKnownCodes + $script:LtExtraCodes | ForEach-Object { $_.ToUpper() } | Sort-Object -Unique)
+    foreach ($code in $allCodes) { Remove-MsiLeftovers $code }
     Remove-ArpEntries $LtProductPredicate
 
-    Remove-PathPatterns -Patterns $LtFolders
-    foreach ($k in $LtRegKeys) { Remove-RegKeySafe $k }
+    # Folders
+    $folders = @($script:LtBasePaths)
+    foreach ($t in "$env:windir\Temp", "$env:windir\SystemTemp") {
+        foreach ($i in $LtTempItems) { $folders += Join-Path $t $i }
+    }
+    $folders += "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\Network Monitoring Tray.lnk"
+    $folders += "$env:ALLUSERSPROFILE\Start Menu\Programs\Startup\Network Monitoring Tray.lnk"
+    if (-not $hasControlCenter) { $folders += "$env:ProgramData\LabTech" }
+    Remove-PathPatterns -Patterns $folders
+
+    # Registry
+    foreach ($root in 'HKLM:\SOFTWARE\LabTech', 'HKLM:\SOFTWARE\WOW6432Node\LabTech') {
+        if ($hasControlCenter) { foreach ($sk in $LtRegSubKeys) { Remove-RegKeySafe "$root\$sk" } }
+        else { Remove-RegKeySafe $root }
+    }
+    Remove-RegKeySafe 'HKLM:\SOFTWARE\LabTechMSP'
+    Remove-RegKeySafe 'HKLM:\SOFTWARE\WOW6432Node\LabTechMSP'
+    if (-not $hasControlCenter) {
+        foreach ($sid in Get-LoadedUserHives) { Remove-RegKeySafe "Registry::HKEY_USERS\$sid\SOFTWARE\LabTech" }
+    }
+    foreach ($t in $LtTracingKeys) {
+        Remove-RegKeySafe "HKLM:\SOFTWARE\Microsoft\Tracing\$t"
+        Remove-RegKeySafe "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Tracing\$t"
+    }
+    Remove-RegKeySafe 'HKLM:\SOFTWARE\Sysinternals'
+    Remove-RegKeySafe 'HKLM:\SOFTWARE\WOW6432Node\Sysinternals'
+    # LabVNC is UltraVNC-based - keep these keys if a standalone UltraVNC is installed
+    $uvnc = (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\uvnc_service') -or
+            (Test-Path "$env:ProgramFiles\uvnc bvba") -or
+            (${env:ProgramFiles(x86)} -and (Test-Path "${env:ProgramFiles(x86)}\uvnc bvba"))
+    if ($uvnc) { Write-Log 'Standalone UltraVNC detected - keeping UltraVNC/ORL registry keys' }
+    else { foreach ($k in 'HKLM:\SOFTWARE\UltraVNC', 'HKLM:\SOFTWARE\ORL') { Remove-RegKeySafe $k } }
 
     $evtFilter = { param($n) ($LtServiceNames -contains $n) -or ($n -match '^LabTech') }
     Remove-RegChildren 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application' $evtFilter
+    # tvnserver = TightVNC; only drop its Safe Mode entry if no TightVNC service is left
+    $safeBootNames = @($LtServiceNames)
+    if (-not (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\tvnserver')) { $safeBootNames += 'tvnserver' }
     foreach ($mode in 'Minimal', 'Network') {
-        Remove-RegChildren "HKLM:\SYSTEM\CurrentControlSet\Control\SafeBoot\$mode" { param($n) $LtServiceNames -contains $n }
+        Remove-RegChildren "HKLM:\SYSTEM\CurrentControlSet\Control\SafeBoot\$mode" { param($n) $safeBootNames -contains $n }
     }
 
-    foreach ($rk in Get-RunKeys) { Remove-RegValuesMatching $rk { param($n, $d) & $LtTextPredicate $d } }
+    foreach ($rk in Get-RunKeys) {
+        Remove-RegValuesMatching $rk { param($n, $d) ($n -eq 'LabTech Tray Icon') -or (& $LtTextPredicate $d) }
+    }
     Remove-MatchingScheduledTasks $LtTextPredicate
-    Remove-MatchingFirewallRules { param($d) $d -match '\\LTSvc\\' }
+    Remove-AutomateFirewallRules
+    Reset-AutomatePatchingSettings
 }
 
 function Invoke-ScreenConnectRemoval {
@@ -693,8 +931,8 @@ function Test-Remaining {
 
     if (-not $SkipAutomate) {
         foreach ($s in (Get-ServiceNamesMatching $LtSvcPredicate)) { $left.Add("Service: $s") }
-        foreach ($f in $LtFolders) { if (Test-Path -LiteralPath $f) { $left.Add("Folder: $f") } }
-        foreach ($e in Get-UninstallEntries) { if ($e.DisplayName -and (& $LtProductPredicate $e.DisplayName)) { $left.Add("Programs entry: $($e.DisplayName)") } }
+        foreach ($f in $script:LtBasePaths) { if (Test-Path -LiteralPath $f) { $left.Add("Folder: $f") } }
+        foreach ($e in Get-UninstallEntries) { if (Test-EntryMatch $e $LtProductPredicate) { $left.Add("Programs entry: $($e.DisplayName)$($e.OldDisplayName)") } }
     }
     if (-not $SkipScreenConnect) {
         foreach ($s in (Get-ServiceNamesMatching $ScSvcPredicate)) { $left.Add("Service: $s") }
@@ -702,7 +940,7 @@ function Test-Remaining {
             if (-not $pat -or $pat -match '^\\') { continue }
             foreach ($i in @(Get-Item -Path $pat -Force -ErrorAction SilentlyContinue)) { if (Test-ScMatch $i.Name) { $left.Add("Folder: $($i.FullName)") } }
         }
-        foreach ($e in Get-UninstallEntries) { if ($e.DisplayName -and (& $ScProductPredicate $e.DisplayName)) { $left.Add("Programs entry: $($e.DisplayName)") } }
+        foreach ($e in Get-UninstallEntries) { if (Test-EntryMatch $e $ScProductPredicate) { $left.Add("Programs entry: $($e.DisplayName)$($e.OldDisplayName)") } }
     }
 
     if ($left.Count -eq 0) { Write-Log 'Nothing left behind.' OK }
